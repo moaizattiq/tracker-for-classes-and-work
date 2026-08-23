@@ -65,7 +65,10 @@ button{cursor:pointer;border:none;background:none}
 .tab.on{background:var(--ink);color:var(--bg);font-weight:700}
 .icon{width:28px;height:28px;border:1px solid var(--rule);border-radius:4px;color:var(--ink2);font-size:13px;line-height:1;display:inline-flex;align-items:center;justify-content:center}
 .icon:hover{border-color:var(--accent);color:var(--accent)}
-.dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--ink3)}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block;background:var(--ink3);flex:0 0 auto}
+.syncbtn{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:9.5px;letter-spacing:.08em;color:var(--ink3);border:1px solid var(--rule);border-radius:20px;padding:4px 9px}
+.syncbtn:hover{border-color:var(--accent);color:var(--accent)}
+@media(max-width:560px){#synclab{display:none}.syncbtn{padding:5px 7px}}
 .dot.ok{background:var(--ok)} .dot.bad{background:var(--danger)} .dot.busy{background:var(--warn)}
 
 .subbar{
@@ -285,7 +288,7 @@ function daysBetween(a,b){ return Math.round((parseISO(b)-parseISO(a))/86400000)
 /* ------------------------------ state ------------------------------ */
 const LS = "semesterboard.v2";
 const BLANK = {
-  v:2, updatedAt:0, theme:"dark",
+  v:2, updatedAt:0, syncedAt:0, theme:"dark",
   recurring: DEFAULT_RECURRING.slice(),
   weeks:{}, todos:[], assignments:[], tx:[],
   sync:{url:"", key:""}
@@ -316,62 +319,127 @@ function save(push=true){
 function week(){ if(!S.weeks[UI.week]) S.weeks[UI.week] = []; return S.weeks[UI.week]; }
 
 /* ------------------------------ sync ------------------------------ */
-let pushT = null;
-function queuePush(){
-  if(!S.sync.url) return;
-  clearTimeout(pushT);
-  setSync("busy");
-  pushT = setTimeout(pushNow, 1500);
-}
-function setSync(s){ UI.syncState = s; const el=$("#syncdot"); if(el) el.className = "dot "+(s==="ok"?"ok":s==="bad"?"bad":s==="busy"?"busy":""); }
+let pushT = null, pending = false, lastRemoteAt = 0, syncErr = "";
+
 function syncMode(){ return /^gist:/i.test(S.sync.url) ? "gist" : S.sync.url ? "http" : "off"; }
 function gistURL(){ return "https://api.github.com/gists/" + S.sync.url.replace(/^gist:/i,"").trim(); }
 function ghHeaders(){ return {Authorization:"Bearer "+S.sync.key, Accept:"application/vnd.github+json", "X-GitHub-Api-Version":"2022-11-28"}; }
+function ago(t){
+  const s = Math.round((Date.now()-t)/1000);
+  if(s < 45) return "just now";
+  if(s < 3600) return Math.round(s/60)+"m ago";
+  if(s < 86400) return Math.round(s/3600)+"h ago";
+  return Math.round(s/86400)+"d ago";
+}
+function syncLabel(){
+  if(syncMode()==="off") return "sync off";
+  if(UI.syncState==="busy") return "syncing";
+  if(UI.syncState==="bad") return "sync failed";
+  return S.syncedAt ? "synced "+ago(S.syncedAt) : "not synced yet";
+}
+function setSync(st){
+  UI.syncState = st;
+  const dot = $("#syncdot"), lab = $("#synclab");
+  if(dot) dot.className = "dot "+(st==="ok"?"ok":st==="bad"?"bad":st==="busy"?"busy":"");
+  if(lab) lab.textContent = syncLabel();
+}
+function hasLocalData(){
+  return !!(S.tx.length || S.todos.length || S.assignments.length ||
+    Object.keys(S.weeks).some(k => S.weeks[k] && S.weeks[k].length));
+}
+function writeLocal(){ try{ localStorage.setItem(LS, JSON.stringify(S)); }catch(e){} }
+function adopt(remote){
+  S = Object.assign(clone(BLANK), remote);
+  lastRemoteAt = S.updatedAt || 0;
+  S.syncedAt = Date.now();
+  writeLocal(); render();
+}
 
-async function pushNow(){
-  const mode = syncMode();
-  if(mode==="off") return;
+function queuePush(){
+  if(syncMode()==="off") return;
+  pending = true;
+  clearTimeout(pushT);
+  setSync("busy");
+  pushT = setTimeout(()=>pushNow(), 1200);
+}
+async function pushNow(opts){
+  opts = opts || {};
+  if(syncMode()==="off") return false;
+  clearTimeout(pushT); pending = false;
+  // a slow clock on one device must not make its writes look older than the server copy
+  if((S.updatedAt||0) <= lastRemoteAt) S.updatedAt = lastRemoteAt + 1;
+  const body = JSON.stringify(S);
+  const keep = opts.keepalive && body.length < 58000;
+  setSync("busy");
   try{
     let r;
-    if(mode==="gist"){
-      r = await fetch(gistURL(), {method:"PATCH", headers:Object.assign({"content-type":"application/json"}, ghHeaders()),
-        body: JSON.stringify({files:{"semester-board.json":{content:JSON.stringify(S)}}})});
+    if(syncMode()==="gist"){
+      r = await fetch(gistURL(), {method:"PATCH", keepalive:keep,
+        headers:Object.assign({"content-type":"application/json"}, ghHeaders()),
+        body: JSON.stringify({files:{"semester-board.json":{content:body}}})});
     } else {
-      r = await fetch(S.sync.url, {method:"PUT", headers:{"x-key":S.sync.key,"content-type":"application/json"}, body:JSON.stringify(S)});
+      r = await fetch(S.sync.url, {method:"PUT", keepalive:keep,
+        headers:{"x-key":S.sync.key,"content-type":"application/json"}, body});
     }
-    setSync(r.ok?"ok":"bad");
-  }catch(e){ setSync("bad"); }
+    if(!r.ok) throw new Error("HTTP "+r.status+(r.status===401?" (bad key)":r.status===404?" (endpoint not found)":""));
+    lastRemoteAt = S.updatedAt;
+    S.syncedAt = Date.now(); writeLocal();
+    syncErr = ""; setSync("ok");
+    return true;
+  }catch(e){ syncErr = e.message || "network error"; setSync("bad"); return false; }
 }
 async function fetchRemote(){
   if(syncMode()==="gist"){
     const r = await fetch(gistURL(), {headers:ghHeaders()});
-    if(!r.ok) throw 0;
+    if(!r.ok) throw new Error("HTTP "+r.status+(r.status===401?" (bad token)":r.status===404?" (gist not found)":""));
     const j = await r.json();
     const f = j.files && j.files["semester-board.json"];
-    if(!f) return null;
+    if(!f) return null;   // gist exists but is not seeded yet, that is not an error
     const text = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
-    return JSON.parse(text);
+    try{ return JSON.parse(text); }catch(e){ return null; }
   }
   const r = await fetch(S.sync.url, {headers:{"x-key":S.sync.key}});
-  if(!r.ok) throw 0;
+  if(!r.ok) throw new Error("HTTP "+r.status+(r.status===401?" (bad key)":""));
   return await r.json();
 }
-async function pullNow(silent){
+async function pullNow(silent, force){
   if(syncMode()==="off"){ if(!silent) toast("Set a sync endpoint in settings first."); return; }
   setSync("busy");
   try{
     const remote = await fetchRemote();
-    if(remote && remote.updatedAt && remote.updatedAt > (S.updatedAt||0)){
-      S = Object.assign(clone(BLANK), remote);
-      localStorage.setItem(LS, JSON.stringify(S));
-      setSync("ok"); render();
+    if(remote && typeof remote.updatedAt === "number") lastRemoteAt = remote.updatedAt;
+    if(remote && remote.updatedAt && (force || remote.updatedAt > (S.updatedAt||0))){
+      adopt(remote);
+      syncErr = ""; setSync("ok");
       if(!silent) toast("Pulled the newer copy.");
     } else {
-      setSync("ok");
-      if(!silent) toast("Local copy is already the newest.");
+      S.syncedAt = Date.now(); writeLocal();
+      syncErr = ""; setSync("ok");
+      if(!silent) toast("This device is already the newest copy.");
     }
-  }catch(e){ setSync("bad"); if(!silent) toast("Sync failed. Check the endpoint and the key."); }
+  }catch(e){ syncErr = e.message || "network error"; setSync("bad"); if(!silent) toast("Sync failed: "+syncErr); }
 }
+/* first time an endpoint is entered on a device: decide who wins BEFORE anything pushes,
+   otherwise a fresh phone silently overwrites the laptop. */
+async function handshake(){
+  setSync("busy");
+  let remote = null;
+  try{ remote = await fetchRemote(); }
+  catch(e){ syncErr = e.message; setSync("bad"); toast("Could not reach it: "+syncErr); return; }
+  const hasRemote = !!(remote && remote.updatedAt);
+  if(hasRemote && !hasLocalData()){ adopt(remote); setSync("ok"); toast("Pulled your board onto this device."); return; }
+  if(hasRemote && hasLocalData()){
+    const useRemote = confirm(
+      "Both this device and the server have data.\n\n" +
+      "OK  = use the SERVER copy and replace what is on this device\n" +
+      "Cancel = keep THIS device and overwrite the server");
+    if(useRemote){ adopt(remote); setSync("ok"); toast("Using the server copy."); }
+    else { await pushNow(); toast("Server now matches this device."); render(); }
+    return;
+  }
+  await pushNow(); render(); toast("Connected. This device seeded the server.");
+}
+function flushPush(){ if(pending) pushNow({keepalive:true}); }
 
 /* ------------------------------ collisions ------------------------------ */
 function occupied(day){
@@ -423,7 +491,7 @@ function chrome(){
   const tab = (id,label)=>'<button class="tab '+(UI.tab===id?"on":"")+'" data-act="tab" data-v="'+id+'">'+label+'</button>';
   return '<div class="topbar">'+
     '<div class="mark">SEMESTER<i>/BOARD</i></div>'+
-    '<span id="syncdot" class="dot" title="sync"></span>'+
+    '<button class="syncbtn" data-act="syncnow" title="Sync now"><span id="syncdot" class="dot"></span><span id="synclab">'+syncLabel()+'</span></button>'+
     '<div class="tabs">'+ tab("week","WEEK") + tab("work","WORK") + tab("money","MONEY") +
       '<button class="icon" data-act="theme" title="Theme">'+(S.theme==="dark"?"◐":"◑")+'</button>'+
       '<button class="icon" data-act="settings" title="Settings">≡</button>'+
@@ -918,8 +986,10 @@ function settingsModal(){
     '<div class="row"><input class="f grow" id="sUrl" placeholder="gist:abc123...  or  https://board.you.workers.dev" value="'+esc(S.sync.url)+'"></div>'+
     '<div class="row"><input class="f grow" id="sKey" placeholder="github token, or shared secret" value="'+esc(S.sync.key)+'"></div>'+
     '<div class="hint">Two ways to sync. Paste <b>gist:</b> plus a secret gist id and use a fine grained GitHub token scoped to gists only, and there is no backend to run. Or point it at the Cloudflare worker with its shared secret.</div>'+
-    '<div class="row"><button class="btn" data-act="pull">PULL FROM SERVER</button><button class="btn" data-act="push">PUSH NOW</button></div>'+
-    '<div class="hint">Last write wins. If you edit on your laptop and phone while one of them is offline, the older copy loses. Pull before you start editing on the second device.</div>'+
+    '<div class="hint" style="padding-bottom:8px">Mode: <b>'+syncMode().toUpperCase()+'</b> · '+esc(syncLabel())+(syncErr?' · <span style="color:var(--danger)">'+esc(syncErr)+'</span>':'')+'</div>'+
+    '<div class="row"><button class="btn" data-act="forcepull">PULL, REPLACE THIS DEVICE</button></div>'+
+    '<div class="row"><button class="btn" data-act="forcepush">PUSH, REPLACE THE SERVER</button></div>'+
+    '<div class="hint">You have to enter the endpoint and key on <b>every</b> device, this box is per device. On iPhone, Safari and the home screen icon are separate storage, so set it up in whichever one you actually use.</div>'+
     '<div style="height:12px"></div>'+
     '<label class="lbl">BACKUP</label>'+
     '<div class="row"><button class="btn" data-act="export">EXPORT JSON</button>'+
@@ -1130,9 +1200,18 @@ const ACT = {
   },
   "tx-": el => { S.tx = S.tx.filter(x=>x.id!==el.dataset.v); save(); },
 
-  savesettings: () => { S.sync.url = $("#sUrl").value.trim().replace(/\/$/,""); S.sync.key = $("#sKey").value.trim(); closeModal(); save(); },
-  pull: () => { pullNow(); return true; },
-  push: () => { pushNow(); toast("Pushed."); return true; },
+  savesettings: () => {
+    const before = S.sync.url + "|" + S.sync.key;
+    S.sync.url = $("#sUrl").value.trim().replace(/\/$/,"");
+    S.sync.key = $("#sKey").value.trim();
+    writeLocal();                       // settings are per device, they must not bump updatedAt
+    closeModal(); render();
+    if(syncMode()!=="off" && (S.sync.url+"|"+S.sync.key)!==before) handshake();
+    return true;
+  },
+  syncnow: async () => { if(syncMode()==="off"){ settingsModal(); return true; } await pushNow(); await pullNow(); return true; },
+  forcepull: () => { closeModal(); pullNow(false, true); return true; },
+  forcepush: async () => { closeModal(); const ok = await pushNow(); toast(ok?"Server replaced with this device.":"Push failed: "+syncErr); return true; },
   export: () => { download("semester-board-"+iso(new Date())+".json", JSON.stringify(S,null,2)); return true; },
 };
 
@@ -1190,8 +1269,20 @@ setInterval(()=>{
   if($("#modal").innerHTML) return;
   render();
 }, 60000);
-if(S.sync.url) pullNow(true);
-document.addEventListener("visibilitychange", ()=>{ if(!document.hidden && S.sync.url) pullNow(true); });
+if(syncMode()!=="off") pullNow(true);
+function idle(){
+  const a = document.activeElement;
+  return !($("#modal").innerHTML) && !(a && /INPUT|SELECT|TEXTAREA/.test(a.tagName));
+}
+document.addEventListener("visibilitychange", ()=>{
+  if(document.hidden){ flushPush(); return; }
+  if(syncMode()!=="off") pullNow(true);
+});
+window.addEventListener("pagehide", flushPush);
+window.addEventListener("pageshow", ()=>{ if(syncMode()!=="off") pullNow(true); });
+window.addEventListener("online", ()=>{ if(syncMode()!=="off"){ flushPush(); pullNow(true); } });
+setInterval(()=>{ if(!document.hidden && syncMode()!=="off" && idle()) pullNow(true); }, 25000);
+setInterval(()=>{ const l=$("#synclab"); if(l) l.textContent = syncLabel(); }, 20000);
 </script>
 </body>
 </html>
